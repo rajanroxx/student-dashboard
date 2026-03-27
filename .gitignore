@@ -1,0 +1,30 @@
+node_modules/
+.DS_Store
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Build outputs
+build/
+dist/
+*.xlsx
+!data/students.xlsx
+
+# Frontend build
+frontend/build/
+frontend/.eslintcache
+
+# Backend
+backend/node_modules/
