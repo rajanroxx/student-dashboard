@@ -311,12 +311,187 @@ function App() {
     };
   };
 
+  // Get average performance by subject for selected student
+  const getStudentAveragePerformance = () => {
+    if (!selectedStudent) return {};
+
+    // Get all records for this student
+    let studentData = allData.filter(item => item.Name === selectedStudent);
+    
+    if (selectedClass && !selectedClass.includes('All')) {
+      // Filter by class if needed (class is selected)
+    }
+
+    // Group by subject and calculate average percentage
+    const subjectPerformance = {};
+    studentData.forEach(item => {
+      const subject = item.Subject || 'Unknown';
+      const percentage = Number(item.Total) > 0 
+        ? (Number(item.Marks) / Number(item.Total)) * 100 
+        : 0;
+
+      if (!subjectPerformance[subject]) {
+        subjectPerformance[subject] = { marks: [], percentage: [] };
+      }
+      subjectPerformance[subject].marks.push(Number(item.Marks));
+      subjectPerformance[subject].percentage.push(percentage);
+    });
+
+    // Calculate averages
+    const averageData = {};
+    Object.keys(subjectPerformance).forEach(subject => {
+      const percentages = subjectPerformance[subject].percentage;
+      const avgPercentage = percentages.length > 0 
+        ? percentages.reduce((a, b) => a + b, 0) / percentages.length 
+        : 0;
+      averageData[subject] = avgPercentage;
+    });
+
+    return averageData;
+  };
+
+  // Prepare average performance graph data with color coding
+  const prepareAveragePerformanceChartData = () => {
+    const avgPerformance = getStudentAveragePerformance();
+    const subjects = Object.keys(avgPerformance).sort();
+    const performanceThreshold = 60; // 60% is considered "good" performance
+
+    const colors = subjects.map(subject => {
+      const percentage = avgPerformance[subject];
+      // Green if >= threshold, Red if < threshold
+      return percentage >= performanceThreshold 
+        ? 'rgba(34, 197, 94, 0.8)' // Green
+        : 'rgba(239, 68, 68, 0.8)'; // Red
+    });
+
+    const borderColors = subjects.map(subject => {
+      const percentage = avgPerformance[subject];
+      return percentage >= performanceThreshold 
+        ? 'rgba(34, 197, 94, 1)' 
+        : 'rgba(239, 68, 68, 1)';
+    });
+
+    return {
+      labels: subjects,
+      datasets: [
+        {
+          label: 'Average Performance (%)',
+          data: subjects.map(s => avgPerformance[s].toFixed(1)),
+          backgroundColor: colors,
+          borderColor: borderColors,
+          borderWidth: 2,
+        },
+      ],
+    };
+  };
+
+  // Get DPP comparison data for selected student and subject
+  const getDPPComparisonData = () => {
+    if (!selectedStudent || !selectedSubject) return [];
+
+    // Get all records for this student and subject
+    const studentSubjectData = allData.filter(
+      item => item.Name === selectedStudent && item.Subject === selectedSubject
+    );
+
+    // Sort by test name/DPP number and date
+    return studentSubjectData.sort((a, b) => {
+      // Try to sort by DPP number if available
+      const testA = a.Test || '';
+      const testB = b.Test || '';
+      return testA.localeCompare(testB);
+    });
+  };
+
+  // Prepare DPP comparison chart data
+  const prepareDPPComparisonChartData = () => {
+    const dppData = getDPPComparisonData();
+    
+    if (dppData.length === 0) {
+      return {
+        labels: [],
+        datasets: []
+      };
+    }
+
+    // Group data by Date to show progression over time
+    const dppsByDate = {};
+    dppData.forEach(item => {
+      const date = item.Date || 'Unknown';
+      const testKey = item.Test || 'Unknown';
+      
+      if (!dppsByDate[date]) {
+        dppsByDate[date] = {};
+      }
+      dppsByDate[date][testKey] = {
+        marks: Number(item.Marks),
+        total: Number(item.Total),
+        percentage: Number(item.Total) > 0 
+          ? ((Number(item.Marks) / Number(item.Total)) * 100).toFixed(1)
+          : 0
+      };
+    });
+
+    // Get all unique tests
+    const allTests = [...new Set(dppData.map(item => item.Test))].sort();
+    
+    // Prepare datasets for each test
+    const dates = Object.keys(dppsByDate).sort((a, b) => {
+      try {
+        const dateA = new Date(a.split('-').reverse().join('-'));
+        const dateB = new Date(b.split('-').reverse().join('-'));
+        return isNaN(dateA) || isNaN(dateB) ? 0 : dateA - dateB;
+      } catch {
+        return 0;
+      }
+    });
+
+    // Group by individual DPPs and show percentage for each
+    const dppList = dppData.map(item => ({
+      test: item.Test,
+      date: item.Date,
+      marks: Number(item.Marks),
+      total: Number(item.Total),
+      percentage: Number(item.Total) > 0 
+        ? ((Number(item.Marks) / Number(item.Total)) * 100).toFixed(1)
+        : 0
+    }));
+
+    const performanceThreshold = 60;
+    const colors = dppList.map(item => 
+      Number(item.percentage) >= performanceThreshold
+        ? 'rgba(34, 197, 94, 0.8)' // Green
+        : 'rgba(239, 68, 68, 0.8)' // Red
+    );
+
+    const borderColors = dppList.map(item => 
+      Number(item.percentage) >= performanceThreshold
+        ? 'rgba(34, 197, 94, 1)'
+        : 'rgba(239, 68, 68, 1)'
+    );
+
+    return {
+      labels: dppList.map((item, idx) => `${item.test} (${item.date})`),
+      datasets: [
+        {
+          label: 'Percentage Score',
+          data: dppList.map(item => item.percentage),
+          backgroundColor: colors,
+          borderColor: borderColors,
+          borderWidth: 2,
+        },
+      ],
+    };
+  };
+
   const stats = calculateStats();
   const classData = getClassViewData();
   const subjectStats = getStudentSubjectStats();
   const filteredData = getFilteredData();
   const classViewChart = prepareClassViewChartData();
   const testChart = prepareTestGraphData();
+  const averagePerformanceChart = prepareAveragePerformanceChartData();
+  const dppComparisonChart = prepareDPPComparisonChartData();
 
   return (
     <div className="dashboard-container">
@@ -527,6 +702,85 @@ function App() {
                         ← Back to Class View
                       </button>
                     </div>
+
+                    {/* Average Performance by Subject (when only student is selected) */}
+                    {!selectedSubject && Object.keys(getStudentAveragePerformance()).length > 0 && (
+                      <div className="chart-container">
+                        <h3 className="section-title">📊 Average Performance by Subject</h3>
+                        <p style={{ fontSize: '12px', color: '#666', marginTop: '-10px', marginBottom: '15px' }}>
+                          🟢 Green: Good Performance (≥60%) | 🔴 Red: Needs Improvement (&lt;60%)
+                        </p>
+                        <Bar
+                          data={averagePerformanceChart}
+                          options={{
+                            responsive: true,
+                            maintainAspectRatio: false,
+                            plugins: {
+                              legend: {
+                                position: 'top',
+                              },
+                              title: {
+                                display: false,
+                              },
+                            },
+                            scales: {
+                              y: {
+                                beginAtZero: true,
+                                max: 100,
+                                title: {
+                                  display: true,
+                                  text: 'Percentage (%)'
+                                }
+                              },
+                            },
+                          }}
+                        />
+                      </div>
+                    )}
+
+                    {/* DPP Comparison Graph (when student and subject are selected) */}
+                    {selectedSubject && getDPPComparisonData().length > 0 && (
+                      <div className="chart-container">
+                        <h3 className="section-title">📊 DPP Comparison - {selectedSubject}</h3>
+                        <p style={{ fontSize: '12px', color: '#666', marginTop: '-10px', marginBottom: '15px' }}>
+                          Performance comparison across all DPP tests | 🟢 Green: Good (&gt;60%) | 🔴 Red: Needs Improvement
+                        </p>
+                        <Bar
+                          data={dppComparisonChart}
+                          options={{
+                            indexAxis: getDPPComparisonData().length > 6 ? 'y' : 'x', // Horizontal if more than 6 DPPs
+                            responsive: true,
+                            maintainAspectRatio: false,
+                            plugins: {
+                              legend: {
+                                position: 'top',
+                              },
+                              title: {
+                                display: false,
+                              },
+                            },
+                            scales: {
+                              y: {
+                                beginAtZero: true,
+                                max: 100,
+                                title: {
+                                  display: true,
+                                  text: 'Percentage (%)'
+                                }
+                              },
+                              x: getDPPComparisonData().length > 6 ? {
+                                beginAtZero: true,
+                                max: 100,
+                                title: {
+                                  display: true,
+                                  text: 'Percentage (%)'
+                                }
+                              } : {}
+                            },
+                          }}
+                        />
+                      </div>
+                    )}
 
                     {/* Test-Based Graph */}
                     {Object.keys(subjectStats).length > 0 && selectedTest && (

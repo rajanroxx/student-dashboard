@@ -47,7 +47,7 @@ const processRowData = (row) => {
   return processed;
 };
 
-// Function to read Excel file for specific class
+// Function to read Excel file for specific class (handles new DPP format)
 const readExcelByClass = (className) => {
   try {
     const filePath = path.join(__dirname, '../data/students.xlsx');
@@ -69,35 +69,81 @@ const readExcelByClass = (className) => {
 
     const worksheet = workbook.Sheets[className];
     
-    // Convert sheet to JSON with header row
-    const data = XLSX.utils.sheet_to_json(worksheet, { 
-      header: 1,  // Get raw array format first
+    // Get raw data with header as array format to parse the new DPP structure
+    const rawData = XLSX.utils.sheet_to_json(worksheet, { 
+      header: 1,  // Get raw array format
       defval: ''
     });
 
     // If empty sheet, return empty array
-    if (!data || data.length === 0) {
-      console.warn(`Sheet "${className}" is empty`);
+    if (!rawData || rawData.length < 5) {
+      console.warn(`Sheet "${className}" is empty or has invalid format`);
       return [];
     }
 
-    // Get headers from first row
-    const headers = data[0];
+    // New DPP format:
+    // Row 0: Title
+    // Row 1: Instructions
+    // Row 2: Dates (starting from column 4, aligned with DPP columns)
+    // Row 3: Headers (Sr, Student Name, Subject, Total, DPP1, DPP2, ...)
+    // Row 4+: Data rows
+
+    const dateRow = rawData[2] || [];
+    const headerRow = rawData[3] || [];
     
-    // Expected headers (case-insensitive)
-    const expectedHeaders = ['Name', 'Subject', 'Test', 'Marks', 'Total', 'Date'];
-    const headersMatch = headers.filter(h => expectedHeaders.includes(h)).length > 0;
-    
-    if (!headersMatch) {
-      console.warn(`Sheet "${className}" columns don't match expected format. Expected: ${expectedHeaders.join(', ')}`);
+    // Find where DPP columns start (usually column 4)
+    let dppStartCol = 4;
+    for (let i = 0; i < headerRow.length; i++) {
+      if (typeof headerRow[i] === 'string' && headerRow[i].includes('DPP')) {
+        dppStartCol = i;
+        break;
+      }
     }
 
-    // Convert back to JSON properly
-    const jsonData = XLSX.utils.sheet_to_json(worksheet);
-    
-    // Process rows to convert Excel dates to string format
-    const processedData = jsonData.map(row => processRowData(row));
-    
+    const processedData = [];
+    let lastStudentName = '';
+
+    // Process each data row (starting from row 4)
+    for (let rowIdx = 4; rowIdx < rawData.length; rowIdx++) {
+      const row = rawData[rowIdx];
+      
+      if (!row || row.length < 4) continue;
+
+      const sr = row[0];
+      let studentName = row[1];
+      const subject = row[2];
+      const total = row[3];
+
+      // If student name is empty, use the last known name
+      if (!studentName || studentName === '' || studentName === undefined) {
+        studentName = lastStudentName;
+      } else {
+        lastStudentName = studentName;
+      }
+
+      // Skip if no student name found
+      if (!studentName) continue;
+
+      // For each DPP column, create a record
+      for (let colIdx = dppStartCol; colIdx < row.length; colIdx++) {
+        const marks = row[colIdx];
+        const testName = headerRow[colIdx] || `DPP${colIdx - dppStartCol + 1}`;
+        const date = dateRow[colIdx] || '';
+
+        // Only create record if there are actual marks
+        if (marks !== undefined && marks !== '' && marks !== null) {
+          processedData.push({
+            Name: studentName,
+            Subject: subject || '',
+            Test: testName,
+            Marks: marks,
+            Total: total,
+            Date: convertExcelDateToString(date)
+          });
+        }
+      }
+    }
+
     return processedData;
   } catch (error) {
     console.error('Error reading Excel file:', error.message);
