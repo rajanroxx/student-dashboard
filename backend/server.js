@@ -1,8 +1,9 @@
 const express = require('express');
 const cors = require('cors');
+const mongoose = require('mongoose');
+const multer = require('multer');
 const XLSX = require('xlsx');
-const path = require('path');
-const fs = require('fs');
+const crypto = require('crypto');
 
 const app = express();
 const PORT = 5000;
@@ -11,328 +12,187 @@ const PORT = 5000;
 app.use(cors());
 app.use(express.json());
 
-// Function to convert Excel numeric date to dd-mm-yyyy format
+// Multer setup for file uploads
+const storage = multer.memoryStorage();
+const upload = multer({ storage: storage });
+
+// MongoDB Connection
+mongoose.connect('mongodb://localhost:27017/students-dashboard')
+.then(() => console.log('MongoDB connected'))
+.catch(err => console.error('MongoDB connection error:', err));
+
+// Mongoose Schema
+const studentDataSchema = new mongoose.Schema({
+  Name: String,
+  Subject: String,
+  Test: String,
+  Marks: Number,
+  Total: Number,
+  Date: String, // Storing date as string for simplicity, can be changed to Date type
+  Class: String,
+});
+
+const StudentData = mongoose.model('StudentData', studentDataSchema);
+
+const uploadedFileSchema = new mongoose.Schema({
+  originalName: String,
+  fileHash: { type: String, unique: true },
+  uploadDate: { type: Date, default: Date.now },
+  recordCount: Number,
+});
+
+const UploadedFile = mongoose.model('UploadedFile', uploadedFileSchema);
+
+// Function to convert Excel date to string
 const convertExcelDateToString = (excelDate) => {
-  try {
-    // If it's already a string, return as is
-    if (typeof excelDate === 'string') {
-      return excelDate;
-    }
-    
-    // If it's a number, convert from Excel serial date
+    if (!excelDate) return '';
+    if (typeof excelDate === 'string') return excelDate;
     if (typeof excelDate === 'number') {
-      // Excel dates: days since 1900-01-01, but 1900 is not a leap year in Excel (bug)
-      const date = new Date((excelDate - 25569) * 86400 * 1000);
-      const day = String(date.getDate()).padStart(2, '0');
-      const month = String(date.getMonth() + 1).padStart(2, '0');
-      const year = date.getFullYear();
-      return `${day}-${month}-${year}`;
+        const date = new Date((excelDate - 25569) * 86400 * 1000);
+        const day = String(date.getDate()).padStart(2, '0');
+        const month = String(date.getMonth() + 1).padStart(2, '0');
+        const year = date.getFullYear();
+        return `${day}-${month}-${year}`;
     }
-    
-    return excelDate;
-  } catch {
-    return excelDate;
-  }
+    return '';
 };
 
-// Function to process row data and convert dates
-const processRowData = (row) => {
-  const processed = { ...row };
-  
-  // Convert Date column if it's numeric
-  if (processed.Date !== undefined) {
-    processed.Date = convertExcelDateToString(processed.Date);
-  }
-  
-  return processed;
-};
 
-// Function to read Excel file for specific class (handles new DPP format)
-const readExcelByClass = (className) => {
-  try {
-    const filePath = path.join(__dirname, '../data/students.xlsx');
-    
-    // Check if file exists
-    if (!fs.existsSync(filePath)) {
-      console.error('Excel file not found at:', filePath);
-      return [];
+// API endpoint to upload and process Excel file
+app.post('/upload', upload.single('file'), async (req, res) => {
+    if (!req.file) {
+        return res.status(400).json({ success: false, message: 'No file uploaded.' });
     }
 
-    // Read the Excel file
-    const workbook = XLSX.readFile(filePath);
-    
-    // Check if sheet exists
-    if (!workbook.SheetNames.includes(className)) {
-      console.warn(`Sheet "${className}" not found. Available sheets: ${workbook.SheetNames.join(', ')}`);
-      return [];
-    }
+    try {
+        const fileBuffer = req.file.buffer;
+        const fileHash = crypto.createHash('sha256').update(fileBuffer).digest('hex');
 
-    const worksheet = workbook.Sheets[className];
-    
-    // Get raw data with header as array format to parse the new DPP structure
-    const rawData = XLSX.utils.sheet_to_json(worksheet, { 
-      header: 1,  // Get raw array format
-      defval: ''
-    });
-
-    // If empty sheet, return empty array
-    if (!rawData || rawData.length < 5) {
-      console.warn(`Sheet "${className}" is empty or has invalid format`);
-      return [];
-    }
-
-    // New DPP format:
-    // Row 0: Title
-    // Row 1: Instructions
-    // Row 2: Dates (starting from column 4, aligned with DPP columns)
-    // Row 3: Headers (Sr, Student Name, Subject, Total, DPP1, DPP2, ...)
-    // Row 4+: Data rows
-
-    const dateRow = rawData[2] || [];
-    const headerRow = rawData[3] || [];
-    
-    // Find where DPP columns start (usually column 4)
-    let dppStartCol = 4;
-    for (let i = 0; i < headerRow.length; i++) {
-      if (typeof headerRow[i] === 'string' && headerRow[i].includes('DPP')) {
-        dppStartCol = i;
-        break;
-      }
-    }
-
-    const processedData = [];
-    let lastStudentName = '';
-
-    // Process each data row (starting from row 4)
-    for (let rowIdx = 4; rowIdx < rawData.length; rowIdx++) {
-      const row = rawData[rowIdx];
-      
-      if (!row || row.length < 4) continue;
-
-      const sr = row[0];
-      let studentName = row[1];
-      const subject = row[2];
-      const total = row[3];
-
-      // If student name is empty, use the last known name
-      if (!studentName || studentName === '' || studentName === undefined) {
-        studentName = lastStudentName;
-      } else {
-        lastStudentName = studentName;
-      }
-
-      // Skip if no student name found
-      if (!studentName) continue;
-
-      // For each DPP column, create a record
-      for (let colIdx = dppStartCol; colIdx < row.length; colIdx++) {
-        const marks = row[colIdx];
-        const testName = headerRow[colIdx] || `DPP${colIdx - dppStartCol + 1}`;
-        const date = dateRow[colIdx] || '';
-
-        // Only create record if there are actual marks
-        if (marks !== undefined && marks !== '' && marks !== null) {
-          processedData.push({
-            Name: studentName,
-            Subject: subject || '',
-            Test: testName,
-            Marks: marks,
-            Total: total,
-            Date: convertExcelDateToString(date)
-          });
+        const existingFile = await UploadedFile.findOne({ fileHash });
+        if (existingFile) {
+            return res.status(409).json({ 
+                success: false, 
+                message: `This file has already been uploaded on ${existingFile.uploadDate.toLocaleDateString()}.`,
+            });
         }
-      }
+
+        const workbook = XLSX.read(fileBuffer, { type: 'buffer' });
+        const sheetName = workbook.SheetNames[0];
+        const worksheet = workbook.Sheets[sheetName];
+        const data = XLSX.utils.sheet_to_json(worksheet);
+
+        if (data.length === 0) {
+            return res.status(400).json({ success: false, message: 'Excel file is empty.' });
+        }
+
+        const formattedData = data.map(row => ({
+            Name: row['Student Name'],
+            Subject: row['Subject'],
+            Test: row['Test'] || 'General', // Default value if 'Test' is not in Excel
+            Marks: row['Obtained Marks'],
+            Total: row['Total Marks'],
+            Date: convertExcelDateToString(row['Date']),
+            Class: row['Class'],
+        }));
+
+        await StudentData.insertMany(formattedData);
+
+        const newFile = new UploadedFile({
+            originalName: req.file.originalname,
+            fileHash: fileHash,
+            recordCount: formattedData.length,
+        });
+        await newFile.save();
+
+        res.json({ success: true, message: 'Data uploaded and saved successfully.' });
+
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            message: 'Error processing file',
+            error: error.message,
+        });
     }
+});
 
-    return processedData;
-  } catch (error) {
-    console.error('Error reading Excel file:', error.message);
-    return [];
-  }
-};
 
-// Function to get all available sheets (classes)
-const getAllAvailableSheets = () => {
+// API endpoint to get all marks
+app.get('/marks', async (req, res) => {
   try {
-    const filePath = path.join(__dirname, '../data/students.xlsx');
+    const allData = await StudentData.find();
+    const allClasses = [...new Set(allData.map(item => item.Class))];
     
-    if (!fs.existsSync(filePath)) {
-      return [];
-    }
-
-    const workbook = XLSX.readFile(filePath);
-    return workbook.SheetNames;
+    res.json({
+      success: true,
+      data: allData,
+      count: allData.length,
+      classes: allClasses,
+    });
   } catch (error) {
-    console.error('Error reading Excel sheets:', error.message);
-    return [];
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching marks',
+      error: error.message,
+    });
   }
-};
+});
 
 // API endpoint to get marks by class name
-app.get('/marks/:className', (req, res) => {
+app.get('/marks/:className', async (req, res) => {
   try {
     const className = req.params.className;
-    const data = readExcelByClass(className);
+    const data = await StudentData.find({ Class: className });
     
     res.json({
       success: true,
       className: className,
       data: data,
-      count: data.length
+      count: data.length,
     });
   } catch (error) {
     res.status(500).json({
       success: false,
-      message: 'Error fetching marks',
-      error: error.message
+      message: 'Error fetching marks for class',
+      error: error.message,
     });
   }
 });
 
-// API endpoint to get all marks (backward compatibility - returns all sheets combined)
-app.get('/marks', (req, res) => {
+// API endpoint to create a new data entry
+app.post('/marks', async (req, res) => {
   try {
-    const allSheets = getAllAvailableSheets();
-    let allData = [];
-    
-    // Combine data from all sheets
-    allSheets.forEach(sheetName => {
-      const data = readExcelByClass(sheetName);
-      // Add class info to each record
-      allData = allData.concat(data.map(record => ({
-        ...record,
-        Class: sheetName
-      })));
-    });
-
-    res.json({
+    const newData = new StudentData(req.body);
+    await newData.save();
+    res.status(201).json({
       success: true,
-      data: allData,
-      count: allData.length,
-      classes: allSheets
+      message: 'Data entry created successfully',
+      data: newData,
     });
   } catch (error) {
     res.status(500).json({
       success: false,
-      message: 'Error fetching marks',
-      error: error.message
+      message: 'Error creating data entry',
+      error: error.message,
     });
   }
 });
 
-// API endpoint to refresh data
-app.post('/refresh', (req, res) => {
-  try {
-    const allSheets = getAllAvailableSheets();
-    let allData = [];
-    
-    allSheets.forEach(sheetName => {
-      const data = readExcelByClass(sheetName);
-      allData = allData.concat(data.map(record => ({
-        ...record,
-        Class: sheetName
-      })));
-    });
-
-    res.json({
-      success: true,
-      message: 'Data refreshed successfully',
-      data: allData,
-      count: allData.length,
-      classes: allSheets
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Error refreshing data',
-      error: error.message
-    });
-  }
-});
-
-// API endpoint to verify a sheet format
-app.get('/verify/:className', (req, res) => {
-  try {
-    const className = req.params.className;
-    const filePath = path.join(__dirname, '../data/students.xlsx');
-    
-    if (!fs.existsSync(filePath)) {
-      return res.status(404).json({
-        success: false,
-        message: 'Excel file not found'
-      });
-    }
-
-    const workbook = XLSX.readFile(filePath);
-    
-    if (!workbook.SheetNames.includes(className)) {
-      return res.status(404).json({
-        success: false,
-        message: `Sheet "${className}" not found`,
-        availableSheets: workbook.SheetNames
-      });
-    }
-
-    const worksheet = workbook.Sheets[className];
-    const data = XLSX.utils.sheet_to_json(worksheet);
-    
-    // Process dates in data
-    const processedData = data.map(row => processRowData(row));
-    // Check format
-    const expectedColumns = ['Name', 'Subject', 'Test', 'Marks', 'Total', 'Date'];
-    const actualColumns = processedData.length > 0 ? Object.keys(processedData[0]) : [];
-    
-    const status = {
-      success: true,
-      className: className,
-      recordCount: processedData.length,
-      hasData: processedData.length > 0,
-      columns: {
-        expected: expectedColumns,
-        actual: actualColumns,
-        match: JSON.stringify(expectedColumns) === JSON.stringify(actualColumns)
-      },
-      sampleRecord: processedData.length > 0 ? processedData[0] : null,
-      issues: []
-    };
-
-    // Check for issues
-    if (processedData.length === 0) {
-      status.issues.push('Sheet is empty - no data records found');
-    }
-    
-    if (actualColumns.length === 0) {
-      status.issues.push('No columns detected - ensure headers exist in first row');
-    }
-    
-    if (!status.columns.match) {
-      status.issues.push(`Column mismatch. Ensure exact headers: ${expectedColumns.join(', ')}`);
-    }
-
-    res.json(status);
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Error verifying sheet',
-      error: error.message
-    });
-  }
-});
 
 // API endpoint to get all available classes
-app.get('/classes', (req, res) => {
+app.get('/classes', async (req, res) => {
   try {
-    const classes = getAllAvailableSheets();
+    const allData = await StudentData.find();
+    const classes = [...new Set(allData.map(item => item.Class))];
     res.json({
       success: true,
       classes: classes,
-      count: classes.length
+      count: classes.length,
     });
   } catch (error) {
     res.status(500).json({
       success: false,
       message: 'Error fetching classes',
-      error: error.message
+      error: error.message,
     });
   }
 });
@@ -349,7 +209,6 @@ app.listen(PORT, () => {
   console.log(`All Marks API: http://localhost:${PORT}/marks`);
   console.log(`Marks by Class: http://localhost:${PORT}/marks/:className`);
   console.log(`Available Classes: http://localhost:${PORT}/classes`);
-  console.log(`Verify Sheet: http://localhost:${PORT}/verify/:className`);
-  console.log(`Create New Class: POST http://localhost:${PORT}/classes`);
-  console.log(`Refresh Data: POST http://localhost:${PORT}/refresh`);
+  console.log(`Create New Entry: POST http://localhost:${PORT}/marks`);
+  console.log(`Upload Excel: POST http://localhost:${PORT}/upload`);
 });
