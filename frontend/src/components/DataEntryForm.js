@@ -26,17 +26,18 @@ function DataEntryForm({ availableClasses, onDataAdded }) {
     setError(null);
     setSuccess(null);
 
-    const [year, month, day] = formData.Date.split('-');
-    const formattedDate = `${day}-${month}-${year}`;
-
     try {
-      await axios.post('http://localhost:5000/marks', { ...formData, Date: formattedDate });
+      // The date from the input is already in 'yyyy-mm-dd' format, which is a valid
+      // string for the JavaScript Date constructor, so we can send it directly.
+      await axios.post('http://localhost:5000/marks', formData);
       setSuccess('✓ Data added successfully!');
       setFormData({
         ...formData,
         Name: '',
         Marks: '',
         Total: '',
+        // Reset date to today after successful submission
+        Date: new Date().toISOString().split('T')[0],
       });
       if (onDataAdded) {
         onDataAdded();

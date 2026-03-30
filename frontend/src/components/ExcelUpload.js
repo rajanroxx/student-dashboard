@@ -21,7 +21,7 @@ function ExcelUpload({ onUploadSuccess }) {
     }
 
     const formData = new FormData();
-    formData.append('excel-file', file);
+    formData.append('file', file);
 
     setIsUploading(true);
     setError(null);

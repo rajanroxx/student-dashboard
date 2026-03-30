@@ -10,7 +10,8 @@ const PORT = 5000;
 
 // Middleware
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 // Multer setup for file uploads
 const storage = multer.memoryStorage();
@@ -28,7 +29,7 @@ const studentDataSchema = new mongoose.Schema({
   Test: String,
   Marks: Number,
   Total: Number,
-  Date: String, // Storing date as string for simplicity, can be changed to Date type
+  Date: { type: Date },
   Class: String,
 });
 
@@ -43,18 +44,45 @@ const uploadedFileSchema = new mongoose.Schema({
 
 const UploadedFile = mongoose.model('UploadedFile', uploadedFileSchema);
 
-// Function to convert Excel date to string
-const convertExcelDateToString = (excelDate) => {
-    if (!excelDate) return '';
-    if (typeof excelDate === 'string') return excelDate;
-    if (typeof excelDate === 'number') {
-        const date = new Date((excelDate - 25569) * 86400 * 1000);
-        const day = String(date.getDate()).padStart(2, '0');
-        const month = String(date.getMonth() + 1).padStart(2, '0');
-        const year = date.getFullYear();
-        return `${day}-${month}-${year}`;
+// Function to convert Excel date to a Date object
+const convertExcelDate = (excelDate) => {
+    if (!excelDate) return null;
+
+    // If it's already a Date object, return it
+    if (excelDate instanceof Date) {
+        return excelDate;
     }
-    return '';
+
+    // If it's a number (Excel's serial date)
+    if (typeof excelDate === 'number') {
+        // Adjust for timezone offset by creating a UTC date
+        const utcDate = new Date(Date.UTC(0, 0, excelDate - 1));
+        return utcDate;
+    }
+
+    // If it's a string, try to parse it
+    if (typeof excelDate === 'string') {
+        // Handles 'dd-mm-yyyy', 'mm/dd/yyyy', 'yyyy-mm-dd' etc.
+        const date = new Date(excelDate);
+        // Check if the parsed date is valid
+        if (!isNaN(date.getTime())) {
+            return date;
+        }
+        // Try parsing 'dd-mm-yyyy' manually
+        const parts = excelDate.match(/(\d{1,2})[/-](\d{1,2})[/-](\d{4})/);
+        if (parts) {
+            // Assuming format dd-mm-yyyy
+            const day = parseInt(parts[1], 10);
+            const month = parseInt(parts[2], 10) - 1; // Month is 0-indexed
+            const year = parseInt(parts[3], 10);
+            const manualDate = new Date(Date.UTC(year, month, day));
+            if (!isNaN(manualDate.getTime())) {
+                return manualDate;
+            }
+        }
+    }
+    
+    return null; // Return null if conversion fails
 };
 
 
@@ -76,27 +104,58 @@ app.post('/upload', upload.single('file'), async (req, res) => {
             });
         }
 
-        const workbook = XLSX.read(fileBuffer, { type: 'buffer' });
+        const workbook = XLSX.read(fileBuffer, { type: 'buffer', cellDates: true });
         const sheetName = workbook.SheetNames[0];
         const worksheet = workbook.Sheets[sheetName];
-        const data = XLSX.utils.sheet_to_json(worksheet);
+        const data = XLSX.utils.sheet_to_json(worksheet, { raw: false });
 
         if (data.length === 0) {
             return res.status(400).json({ success: false, message: 'Excel file is empty.' });
         }
 
-        const formattedData = data.map(row => ({
-            Name: row['Student Name'],
-            Subject: row['Subject'],
-            Test: row['Test'] || 'General', // Default value if 'Test' is not in Excel
-            Marks: row['Obtained Marks'],
-            Total: row['Total Marks'],
-            Date: convertExcelDateToString(row['Date']),
-            Class: row['Class'],
-        }));
+        // --- Dynamic Date Column Finder ---
+        let dateColumnName = '';
+        if (data.length > 0) {
+            const headers = Object.keys(data[0]);
+            const possibleDateHeaders = ['date', 'test date', 'exam date']; // Lowercase for case-insensitive comparison
+            
+            for (const header of headers) {
+                if (possibleDateHeaders.includes(header.toLowerCase())) {
+                    dateColumnName = header;
+                    break;
+                }
+            }
+        }
+        console.log(`Found date column: '${dateColumnName}'`);
+        // --- End Dynamic Date Column Finder ---
 
-        await StudentData.insertMany(formattedData);
 
+        // Diagnostic logging
+        if (data.length > 0) {
+            console.log('Column Headers:', Object.keys(data[0]));
+            console.log('--- First 5 Rows of Data ---');
+            data.slice(0, 5).forEach((row, index) => {
+                const rawDate = dateColumnName ? row[dateColumnName] : null;
+                const convertedDate = convertExcelDate(rawDate);
+                console.log(`Row ${index + 1}: Raw Date Value:`, rawDate, `(Type: ${typeof rawDate})`, `| Converted Date:`, convertedDate);
+            });
+            console.log('--------------------------');
+        }
+
+        const formattedData = data.map(row => {
+            const dateValue = dateColumnName ? row[dateColumnName] : null;
+            return {
+                Name: row['Student Name'],
+                Subject: row['Subject'],
+                Test: row['Test'] || 'General',
+                Marks: row['Obtained Marks'],
+                Total: row['Total Marks'],
+                Date: convertExcelDate(dateValue),
+                Class: row['Class'],
+            };
+        });
+        
+        // We will first insert the file record, and if that fails, we don't insert the data
         const newFile = new UploadedFile({
             originalName: req.file.originalname,
             fileHash: fileHash,
@@ -104,9 +163,25 @@ app.post('/upload', upload.single('file'), async (req, res) => {
         });
         await newFile.save();
 
+        try {
+            await StudentData.insertMany(formattedData);
+        } catch (dataInsertError) {
+            // If data insertion fails, we roll back the file record
+            await UploadedFile.deleteOne({ fileHash });
+            throw dataInsertError;
+        }
+
         res.json({ success: true, message: 'Data uploaded and saved successfully.' });
 
     } catch (error) {
+        console.error('Upload Error:', error);
+        // Check for unique constraint violation on fileHash
+        if (error.code === 11000) {
+            return res.status(409).json({
+                success: false,
+                message: 'This file has already been uploaded.',
+            });
+        }
         res.status(500).json({
             success: false,
             message: 'Error processing file',

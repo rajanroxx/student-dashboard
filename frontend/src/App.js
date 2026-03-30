@@ -96,13 +96,20 @@ function App() {
     }
   };
 
-  const uniqueDates = useMemo(() => [...new Set(allData.map(item => item.Date).filter(Boolean))].sort((a, b) => new Date(a.split('-').reverse().join('-')) - new Date(b.split('-').reverse().join('-'))), [allData]);
-  const uniqueTests = useMemo(() => [...new Set(allData.filter(item => !selectedDate || item.Date === selectedDate).map(item => item.Test).filter(Boolean))].sort(), [allData, selectedDate]);
-  const uniqueStudents = useMemo(() => [...new Set(allData.filter(item => (!selectedDate || item.Date === selectedDate) && (!selectedTest || item.Test === selectedTest)).map(item => item.Name).filter(Boolean))].sort(), [allData, selectedDate, selectedTest]);
-  const uniqueSubjects = useMemo(() => [...new Set(allData.filter(item => (!selectedDate || item.Date === selectedDate) && (!selectedTest || item.Test === selectedTest) && (!selectedStudent || item.Name === selectedStudent)).map(item => item.Subject).filter(Boolean))].sort(), [allData, selectedDate, selectedTest, selectedStudent]);
+  const uniqueDates = useMemo(() => {
+    const dates = [...new Set(allData.map(item => item.Date).filter(Boolean))];
+    // Sort by date chronologically
+    dates.sort((a, b) => new Date(a) - new Date(b));
+    // Return formatted unique dates
+    return dates.map(date => formatDate(date));
+  }, [allData]);
+
+  const uniqueTests = useMemo(() => [...new Set(allData.filter(item => !selectedDate || formatDate(item.Date) === selectedDate).map(item => item.Test).filter(Boolean))].sort(), [allData, selectedDate]);
+  const uniqueStudents = useMemo(() => [...new Set(allData.filter(item => (!selectedDate || formatDate(item.Date) === selectedDate) && (!selectedTest || item.Test === selectedTest)).map(item => item.Name).filter(Boolean))].sort(), [allData, selectedDate, selectedTest]);
+  const uniqueSubjects = useMemo(() => [...new Set(allData.filter(item => (!selectedDate || formatDate(item.Date) === selectedDate) && (!selectedTest || item.Test === selectedTest) && (!selectedStudent || item.Name === selectedStudent)).map(item => item.Subject).filter(Boolean))].sort(), [allData, selectedDate, selectedTest, selectedStudent]);
 
   const filteredData = useMemo(() => allData.filter(item => 
-    (!selectedDate || item.Date === selectedDate) &&
+    (!selectedDate || formatDate(item.Date) === selectedDate) &&
     (!selectedTest || item.Test === selectedTest) &&
     (!selectedStudent || item.Name === selectedStudent) &&
     (!selectedSubject || item.Subject === selectedSubject)
@@ -204,12 +211,13 @@ function App() {
     allData
       .filter(item => item.Name === selectedStudent && (!selectedSubject || item.Subject === selectedSubject))
       .forEach(item => {
-        const date = item.Date;
-        if (!progressMap[date]) {
-          progressMap[date] = { date, totalMarks: 0, totalPossible: 0 };
+        // Group by the formatted date string to combine entries from the same day
+        const formatted = formatDate(item.Date);
+        if (!progressMap[formatted]) {
+          progressMap[formatted] = { date: item.Date, totalMarks: 0, totalPossible: 0 };
         }
-        progressMap[date].totalMarks += Number(item.Marks) || 0;
-        progressMap[date].totalPossible += Number(item.Total) || 0;
+        progressMap[formatted].totalMarks += Number(item.Marks) || 0;
+        progressMap[formatted].totalPossible += Number(item.Total) || 0;
       });
   
     return Object.values(progressMap)
@@ -217,7 +225,8 @@ function App() {
         ...item,
         percentage: item.totalPossible > 0 ? (item.totalMarks / item.totalPossible) * 100 : 0,
       }))
-      .sort((a, b) => new Date(a.date.split('-').reverse().join('-')) - new Date(b.date.split('-').reverse().join('-')));
+      // Sort chronologically by the original date object
+      .sort((a, b) => new Date(a.date) - new Date(b.date));
   }, [allData, selectedStudent, selectedSubject]);
   
   const studentProgressChart = useMemo(() => ({
