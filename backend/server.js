@@ -8,282 +8,221 @@ const crypto = require('crypto');
 const app = express();
 const PORT = 5000;
 
-// Middleware
 app.use(cors());
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ limit: '50mb', extended: true }));
+app.use(express.json());
 
-// Multer setup for file uploads
-const storage = multer.memoryStorage();
-const upload = multer({ storage: storage });
+const upload = multer({ storage: multer.memoryStorage() });
 
-// MongoDB Connection
 mongoose.connect('mongodb://localhost:27017/students-dashboard')
-.then(() => console.log('MongoDB connected'))
-.catch(err => console.error('MongoDB connection error:', err));
+  .then(() => console.log('MongoDB connected'))
+  .catch(err => console.error('MongoDB error:', err));
 
-// Mongoose Schema
-const studentDataSchema = new mongoose.Schema({
-  Name: String,
-  Subject: String,
-  Test: String,
-  Marks: Number,
-  Total: Number,
-  Date: { type: Date },
-  Class: String,
-});
+// ── Schemas ───────────────────────────────────────────────────────────────────
+const studentSchema = new mongoose.Schema({
+  name:    { type: String, required: true },
+  subject: { type: String, required: true },
+  test:    { type: String, default: 'General' },
+  marks:   { type: Number, required: true },
+  total:   { type: Number, required: true },
+  date:    { type: Date },
+  class:   { type: String, required: true },
+}, { timestamps: true });
 
-const StudentData = mongoose.model('StudentData', studentDataSchema);
+const Student = mongoose.model('Student', studentSchema);
 
-const uploadedFileSchema = new mongoose.Schema({
+const fileSchema = new mongoose.Schema({
   originalName: String,
-  fileHash: { type: String, unique: true },
-  uploadDate: { type: Date, default: Date.now },
-  recordCount: Number,
+  fileHash:     { type: String, unique: true },
+  status:       { type: String, enum: ['processing', 'done', 'failed'], default: 'processing' },
+  uploadedAt:   { type: Date, default: Date.now },
+  totalRows:    Number,
+  savedRows:    Number,
+  skippedRows:  Number,
+  errors:       [{ row: Number, reason: String }],
 });
 
-const UploadedFile = mongoose.model('UploadedFile', uploadedFileSchema);
+const UploadedFile = mongoose.model('UploadedFile', fileSchema);
 
-// Function to convert Excel date to a Date object
-const convertExcelDate = (excelDate) => {
-    if (!excelDate) return null;
+// ── Helpers ───────────────────────────────────────────────────────────────────
+const toStudent = row => ({
+  name:    row['Student Name'],
+  subject: row['Subject'],
+  test:    row['Test'] || 'General',
+  marks:   Number(row['Obtained Marks']),
+  total:   Number(row['Total Marks']),
+  date:    row['Date'] ? new Date(row['Date']) : null,
+  class:   row['Class'],
+});
 
-    // If it's already a Date object, return it
-    if (excelDate instanceof Date) {
-        return excelDate;
-    }
-
-    // If it's a number (Excel's serial date)
-    if (typeof excelDate === 'number') {
-        // Adjust for timezone offset by creating a UTC date
-        const utcDate = new Date(Date.UTC(0, 0, excelDate - 1));
-        return utcDate;
-    }
-
-    // If it's a string, try to parse it
-    if (typeof excelDate === 'string') {
-        // Handles 'dd-mm-yyyy', 'mm/dd/yyyy', 'yyyy-mm-dd' etc.
-        const date = new Date(excelDate);
-        // Check if the parsed date is valid
-        if (!isNaN(date.getTime())) {
-            return date;
-        }
-        // Try parsing 'dd-mm-yyyy' manually
-        const parts = excelDate.match(/(\d{1,2})[/-](\d{1,2})[/-](\d{4})/);
-        if (parts) {
-            // Assuming format dd-mm-yyyy
-            const day = parseInt(parts[1], 10);
-            const month = parseInt(parts[2], 10) - 1; // Month is 0-indexed
-            const year = parseInt(parts[3], 10);
-            const manualDate = new Date(Date.UTC(year, month, day));
-            if (!isNaN(manualDate.getTime())) {
-                return manualDate;
-            }
-        }
-    }
-    
-    return null; // Return null if conversion fails
+const validateStudent = s => {
+  if (!s.name)           return 'Missing Student Name';
+  if (!s.subject)        return 'Missing Subject';
+  if (!s.class)          return 'Missing Class';
+  if (isNaN(s.marks))    return 'Invalid Obtained Marks';
+  if (isNaN(s.total))    return 'Invalid Total Marks';
+  if (s.marks > s.total) return 'Marks exceed Total';
+  return null;
 };
 
+const BATCH = 500;
+const batchInsert = async docs => {
+  for (let i = 0; i < docs.length; i += BATCH)
+    await Student.insertMany(docs.slice(i, i + BATCH), { ordered: false });
+};
 
-// API endpoint to upload and process Excel file
-app.post('/upload', upload.single('file'), async (req, res) => {
-    if (!req.file) {
-        return res.status(400).json({ success: false, message: 'No file uploaded.' });
-    }
+// ── Health ────────────────────────────────────────────────────────────────────
+app.get('/health', (_, res) => res.json({ status: 'running' }));
 
-    try {
-        const fileBuffer = req.file.buffer;
-        const fileHash = crypto.createHash('sha256').update(fileBuffer).digest('hex');
-
-        const existingFile = await UploadedFile.findOne({ fileHash });
-        if (existingFile) {
-            return res.status(409).json({ 
-                success: false, 
-                message: `This file has already been uploaded on ${existingFile.uploadDate.toLocaleDateString()}.`,
-            });
-        }
-
-        const workbook = XLSX.read(fileBuffer, { type: 'buffer', cellDates: true });
-        const sheetName = workbook.SheetNames[0];
-        const worksheet = workbook.Sheets[sheetName];
-        const data = XLSX.utils.sheet_to_json(worksheet, { raw: false });
-
-        if (data.length === 0) {
-            return res.status(400).json({ success: false, message: 'Excel file is empty.' });
-        }
-
-        // --- Dynamic Date Column Finder ---
-        let dateColumnName = '';
-        if (data.length > 0) {
-            const headers = Object.keys(data[0]);
-            const possibleDateHeaders = ['date', 'test date', 'exam date']; // Lowercase for case-insensitive comparison
-            
-            for (const header of headers) {
-                if (possibleDateHeaders.includes(header.toLowerCase())) {
-                    dateColumnName = header;
-                    break;
-                }
-            }
-        }
-        console.log(`Found date column: '${dateColumnName}'`);
-        // --- End Dynamic Date Column Finder ---
-
-
-        // Diagnostic logging
-        if (data.length > 0) {
-            console.log('Column Headers:', Object.keys(data[0]));
-            console.log('--- First 5 Rows of Data ---');
-            data.slice(0, 5).forEach((row, index) => {
-                const rawDate = dateColumnName ? row[dateColumnName] : null;
-                const convertedDate = convertExcelDate(rawDate);
-                console.log(`Row ${index + 1}: Raw Date Value:`, rawDate, `(Type: ${typeof rawDate})`, `| Converted Date:`, convertedDate);
-            });
-            console.log('--------------------------');
-        }
-
-        const formattedData = data.map(row => {
-            const dateValue = dateColumnName ? row[dateColumnName] : null;
-            return {
-                Name: row['Student Name'],
-                Subject: row['Subject'],
-                Test: row['Test'] || 'General',
-                Marks: row['Obtained Marks'],
-                Total: row['Total Marks'],
-                Date: convertExcelDate(dateValue),
-                Class: row['Class'],
-            };
-        });
-        
-        // We will first insert the file record, and if that fails, we don't insert the data
-        const newFile = new UploadedFile({
-            originalName: req.file.originalname,
-            fileHash: fileHash,
-            recordCount: formattedData.length,
-        });
-        await newFile.save();
-
-        try {
-            await StudentData.insertMany(formattedData);
-        } catch (dataInsertError) {
-            // If data insertion fails, we roll back the file record
-            await UploadedFile.deleteOne({ fileHash });
-            throw dataInsertError;
-        }
-
-        res.json({ success: true, message: 'Data uploaded and saved successfully.' });
-
-    } catch (error) {
-        console.error('Upload Error:', error);
-        // Check for unique constraint violation on fileHash
-        if (error.code === 11000) {
-            return res.status(409).json({
-                success: false,
-                message: 'This file has already been uploaded.',
-            });
-        }
-        res.status(500).json({
-            success: false,
-            message: 'Error processing file',
-            error: error.message,
-        });
-    }
+// ── Classes ───────────────────────────────────────────────────────────────────
+app.get('/classes', async (_, res) => {
+  try {
+    const classes = await Student.distinct('class');
+    res.json({ success: true, classes });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
-
-// API endpoint to get all marks
+// ── Marks: get all / filter ───────────────────────────────────────────────────
 app.get('/marks', async (req, res) => {
   try {
-    const allData = await StudentData.find();
-    const allClasses = [...new Set(allData.map(item => item.Class))];
-    
-    res.json({
-      success: true,
-      data: allData,
-      count: allData.length,
-      classes: allClasses,
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Error fetching marks',
-      error: error.message,
-    });
-  }
+    const filter = {};
+    if (req.query.class)   filter.class   = req.query.class;
+    if (req.query.subject) filter.subject = req.query.subject;
+    if (req.query.test)    filter.test    = req.query.test;
+    if (req.query.name)    filter.name    = req.query.name;
+    if (req.query.dateFrom || req.query.dateTo) {
+      filter.date = {};
+      if (req.query.dateFrom) filter.date.$gte = new Date(req.query.dateFrom);
+      if (req.query.dateTo)   filter.date.$lte = new Date(req.query.dateTo);
+    }
+    const data = await Student.find(filter).sort({ date: -1 });
+    res.json({ success: true, count: data.length, data });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
-// API endpoint to get marks by class name
+// ── Marks: get by class ───────────────────────────────────────────────────────
 app.get('/marks/:className', async (req, res) => {
   try {
-    const className = req.params.className;
-    const data = await StudentData.find({ Class: className });
-    
-    res.json({
-      success: true,
-      className: className,
-      data: data,
-      count: data.length,
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Error fetching marks for class',
-      error: error.message,
-    });
-  }
+    const data = await Student.find({ class: req.params.className }).sort({ date: -1 });
+    res.json({ success: true, class: req.params.className, count: data.length, data });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
-// API endpoint to create a new data entry
+// ── Marks: create single ──────────────────────────────────────────────────────
 app.post('/marks', async (req, res) => {
   try {
-    const newData = new StudentData(req.body);
-    await newData.save();
-    res.status(201).json({
-      success: true,
-      message: 'Data entry created successfully',
-      data: newData,
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Error creating data entry',
-      error: error.message,
-    });
-  }
+    const { name, subject, test, marks, total, date, class: cls } = req.body;
+    if (!name || !subject || !cls || marks == null || total == null)
+      return res.status(400).json({ success: false, message: 'Required: name, subject, class, marks, total' });
+    const s = await Student.create({ name, subject, test, marks: Number(marks), total: Number(total), date, class: cls });
+    res.status(201).json({ success: true, data: s });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
+// ── Marks: bulk create ────────────────────────────────────────────────────────
+// IMPORTANT: register /marks/bulk BEFORE /marks/:id
+app.post('/marks/bulk', async (req, res) => {
+  const { records } = req.body;
+  if (!Array.isArray(records) || records.length === 0)
+    return res.status(400).json({ success: false, message: 'records[] required' });
 
-// API endpoint to get all available classes
-app.get('/classes', async (req, res) => {
+  const valid = [], skipped = [];
+  records.forEach((r, i) => {
+    const err = validateStudent({ ...r, marks: Number(r.marks), total: Number(r.total) });
+    if (err) return skipped.push({ row: i + 1, reason: err });
+    valid.push({ name: r.name, subject: r.subject, test: r.test || 'General',
+      marks: Number(r.marks), total: Number(r.total),
+      date: r.date ? new Date(r.date) : null, class: r.class });
+  });
+
+  if (!valid.length)
+    return res.status(400).json({ success: false, message: 'No valid records', skipped });
+
   try {
-    const allData = await StudentData.find();
-    const classes = [...new Set(allData.map(item => item.Class))];
-    res.json({
-      success: true,
-      classes: classes,
-      count: classes.length,
+    await Student.insertMany(valid, { ordered: false });
+    res.status(201).json({ success: true, saved: valid.length, skipped,
+      message: `Saved ${valid.length} records${skipped.length ? `, skipped ${skipped.length}` : ''}.` });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ── Marks: update ─────────────────────────────────────────────────────────────
+app.put('/marks/:id', async (req, res) => {
+  try {
+    const s = await Student.findByIdAndUpdate(req.params.id, req.body, { new: true, runValidators: true });
+    if (!s) return res.status(404).json({ success: false, message: 'Not found' });
+    res.json({ success: true, data: s });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ── Marks: delete ─────────────────────────────────────────────────────────────
+app.delete('/marks/:id', async (req, res) => {
+  try {
+    const s = await Student.findByIdAndDelete(req.params.id);
+    if (!s) return res.status(404).json({ success: false, message: 'Not found' });
+    res.json({ success: true, message: 'Deleted' });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ── Upload Excel ──────────────────────────────────────────────────────────────
+app.post('/upload', upload.single('file'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded' });
+
+  const fileHash = crypto.createHash('sha256').update(req.file.buffer).digest('hex');
+  const existing = await UploadedFile.findOne({ fileHash });
+  if (existing) return res.status(409).json({ success: false,
+    message: `Already uploaded on ${existing.uploadedAt.toLocaleDateString()}` });
+
+  const fileRecord = await UploadedFile.create({ originalName: req.file.originalname, fileHash, status: 'processing' });
+
+  try {
+    const wb = XLSX.read(req.file.buffer, { type: 'buffer', cellDates: true });
+    const rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { raw: false, defval: '' });
+    if (!rows.length) { await UploadedFile.findByIdAndUpdate(fileRecord._id, { status: 'failed' });
+      return res.status(400).json({ success: false, message: 'Empty file' }); }
+
+    const valid = [], rowErrors = [];
+    rows.forEach((row, i) => {
+      const s = toStudent(row);
+      const err = validateStudent(s);
+      err ? rowErrors.push({ row: i + 2, reason: err }) : valid.push(s);
     });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Error fetching classes',
-      error: error.message,
-    });
+
+    if (!valid.length) { await UploadedFile.findByIdAndUpdate(fileRecord._id, { status: 'failed',
+      totalRows: rows.length, savedRows: 0, skippedRows: rowErrors.length, errors: rowErrors });
+      return res.status(400).json({ success: false, message: 'No valid rows', errors: rowErrors }); }
+
+    await batchInsert(valid);
+    await UploadedFile.findByIdAndUpdate(fileRecord._id, { status: 'done',
+      totalRows: rows.length, savedRows: valid.length, skippedRows: rowErrors.length, errors: rowErrors });
+
+    res.json({ success: true, message: `Uploaded. ${valid.length} saved, ${rowErrors.length} skipped.`, skipped: rowErrors });
+  } catch (err) {
+    await UploadedFile.findByIdAndUpdate(fileRecord._id, { status: 'failed' });
+    res.status(500).json({ success: false, message: err.message });
   }
 });
 
-// Health check endpoint
-app.get('/health', (req, res) => {
-  res.json({ status: 'Backend server is running' });
+// ── Analytics endpoint ────────────────────────────────────────────────────────
+app.get('/analytics', async (req, res) => {
+  try {
+    const filter = {};
+    if (req.query.class) filter.class = req.query.class;
+
+    const data = await Student.find(filter);
+    if (!data.length) return res.json({ success: true, analytics: {} });
+
+    // Top performers
+    const studentMap = {};
+    data.forEach(d => {
+      if (!studentMap[d.name]) studentMap[d.name] = { name: d.name, marks: 0, total: 0 };
+      studentMap[d.name].marks += d.marks;
+      studentMap[d.name].total += d.total;
+    });
+    const topPerformers = Object.values(studentMap)
+      .map(s => ({ ...s, pct: s.total > 0 ? (s.marks / s.total) * 100 : 0 }))
+      .sort((a, b) => b.pct - a.pct).slice(0, 5);
+
+    res.json({ success: true, analytics: { topPerformers, totalStudents: Object.keys(studentMap).length, totalRecords: data.length } });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
-// Start server
-app.listen(PORT, () => {
-  console.log(`Server is running on http://localhost:${PORT}`);
-  console.log(`Health check: http://localhost:${PORT}/health`);
-  console.log(`All Marks API: http://localhost:${PORT}/marks`);
-  console.log(`Marks by Class: http://localhost:${PORT}/marks/:className`);
-  console.log(`Available Classes: http://localhost:${PORT}/classes`);
-  console.log(`Create New Entry: POST http://localhost:${PORT}/marks`);
-  console.log(`Upload Excel: POST http://localhost:${PORT}/upload`);
-});
+app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
